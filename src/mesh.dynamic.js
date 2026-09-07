@@ -799,8 +799,7 @@ return {
 
     /**
      * A dsh child's question routes to the parent the same way its approvals do,
-     * WHEN the host composes a `userQuestions/request` waterfall (an optional,
-     * plugin-agnostic extension point). Without it, a managed dsh child's
+     * through the user-questions answerer waterfall. Without it, a managed dsh child's
      * question still reaches the human UI — the parent is simply not the one
      * asked — so this bridge is best-effort and installs only when the seam
      * exists. A Claude child's question is routed by claude-in-dsh itself
@@ -808,23 +807,34 @@ return {
      */
     function installQuestionBridge() {
       if (typeof ctx.on !== 'function') return () => undefined
-      let dispose = () => undefined
-      try {
-        dispose = ctx.on('userQuestions/request', (request, next) => {
-          const session = request.agent === undefined ? undefined : request.agent.session
-          const childId = session === undefined ? '' : session.id
+      const disposers = []
+      // dsh renamed this waterfall between 0.1.1-rc and 0.1.2 (camelCase to
+      // hyphenated). Listening on both is two cheap registrations and spares
+      // this bridge from silently doing nothing on whichever version it meets —
+      // which is exactly what it did: the old name matched nothing on 0.1.2, so
+      // a managed child's question went straight to the human card and the
+      // parent was never told.
+      for (const event of ['user-questions/request', 'userQuestions/request']) {
+        try {
+          disposers.push(ctx.on(event, (request, next) => {
+          const agent = request.agent
+          const session = agent === undefined ? undefined : agent.session
+          const childId = session !== undefined && session.id !== undefined
+            ? session.id
+            : (agent === undefined ? '' : (agent.id || ''))
           const child = children.get(childId)
           if (child === undefined || child.approvals === 'human') return next()
           // A standing allow/deny has no meaning for a question (there is
           // nothing to allow), so those postures let the human answer.
           if (child.approvals === 'allow' || child.approvals === 'deny') return next()
           return parkQuestionForDshChild(child, request)
-        }, true)
-      } catch (error) {
-        // The seam is optional; its absence is not an error.
-        return () => undefined
+          }, true))
+        } catch (error) {
+          // An event this dsh does not define is not an error; the other name
+          // in the list is the one that matters on this version.
+        }
       }
-      return dispose
+      return () => { for (const dispose of disposers) { try { dispose() } catch (error) { /* gone */ } } }
     }
 
     /**
@@ -842,11 +852,27 @@ return {
       let disposed = false
       let retryTimer
       let restore = () => undefined
+      // dsh 0.1.2 has no `provider` slot at all — answerers compose on the
+      // user-questions waterfall instead. Waiting forever for a slot that will
+      // never appear is an unbounded timer that also hides the fact that this
+      // route is dead on this version, so give up after a bounded wait and let
+      // the waterfall bridge carry it.
+      let waited = 0
+      const WRAP_GIVE_UP_MS = 30_000
       function tryWrap() {
         if (disposed) return
         // The browser wire provider registers during apiProxy activation; wait
         // for it rather than giving up if the mesh activates first.
-        if (uq.provider === undefined) { retryTimer = armTimeout(tryWrap, 500); return }
+        if (uq.provider === undefined) {
+          waited += 500
+          if (waited > WRAP_GIVE_UP_MS) {
+            console.log('agent-mesh: this dsh has no userQuestions.provider slot'
+              + ' — child questions route through the user-questions waterfall instead')
+            return
+          }
+          retryTimer = armTimeout(tryWrap, 500)
+          return
+        }
         const prev = uq.provider
         const wrapper = { ask(request) {
           const agent = request.agent

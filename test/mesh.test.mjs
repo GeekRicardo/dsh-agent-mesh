@@ -22,7 +22,7 @@ function harnessBench(options = {}) {
   const prompts = []
   const cancelled = []
   const commandLines = []
-  const listeners = { 'approval/request': [], 'userQuestions/request': [], 'session/event': [] }
+  const listeners = { 'approval/request': [], 'userQuestions/request': [], 'user-questions/request': [], 'session/event': [] }
   const claudeState = new Map()
   const remoteCalls = []
   const stopped = []
@@ -888,4 +888,46 @@ test('dsh 引擎的子对话不碰这两个参数', async () => {
   const bench = harnessBench()
   await bench.call('agent_open', { engine: 'dsh', remote: 'worker' })
   assert.deepEqual(bench.remoteCalls, [], '目标是 Claude 引擎的概念')
+})
+
+// dsh 在 0.1.1-rc 与 0.1.2 之间把这个瀑布改了名（驼峰 → 连字符）。
+// 之前这里只测驼峰——而代码用的也是驼峰，等于拿代码验自己：真实 dsh 发的
+// 是哪个名字从来没被覆盖过。于是 0.1.2 上桥根本没挂上，子对话的提问直接
+// 落到人类卡片，父对话永远收不到。
+test('提问桥挂在 dsh 真正发的那个事件名上', async () => {
+  const bench = harnessBench()
+  await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  assert.ok(bench.listeners['user-questions/request'][0] !== undefined,
+    '0.1.2 发的是 user-questions/request（连字符）——没挂上就等于没有这个功能')
+  assert.ok(bench.listeners['userQuestions/request'][0] !== undefined,
+    '旧名字也要继续听，一台机器升级不等于所有部署都升级')
+})
+
+test('走连字符事件时，子对话的提问同样park给父对话', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  const listener = bench.listeners['user-questions/request'][0]
+
+  let fellThrough = false
+  const answering = listener({
+    agent: { session: bench.sessions.get(opened.childId) },
+    questions: [{ id: 'q1', header: 'Env', question: '哪个环境？', options: [{ label: 'staging' }] }],
+  }, () => { fellThrough = true; return Promise.resolve({ answers: [] }) })
+  assert.equal(fellThrough, false, '人类卡片不该看到被托管子对话的提问')
+
+  await bench.call('agent_answer', { requestId: 'req-1', answers: [{ id: 'q1', selected: ['staging'] }] })
+  assert.deepEqual(await answering, { answers: [{ id: 'q1', selected: ['staging'] }] })
+})
+
+test('载荷只带 agent.id 时也认得出是哪个子对话', async () => {
+  // 0.1.2 的 emit 是 { ...request, agent }，agent 上不一定挂着 session。
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  const listener = bench.listeners['user-questions/request'][0]
+  let fellThrough = false
+  listener({
+    agent: { id: opened.childId },
+    questions: [{ id: 'q1', header: 'H', question: '?', options: [{ label: 'a' }] }],
+  }, () => { fellThrough = true; return Promise.resolve({ answers: [] }) })
+  assert.equal(fellThrough, false, '只有 id 也该认出来，否则又是静默失效')
 })
