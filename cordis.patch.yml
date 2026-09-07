@@ -1,0 +1,12 @@
+# dsh-agent-mesh bundle patch
+#
+# 安装后（dependencies + dsh.profile.bundles 均含 dsh-agent-mesh），
+# 启动时 profile boot 合并本 patch，把插件行插入 host composition。
+#
+# 本行发布一个服务（multiagentControl，供 claude-in-dsh 读出以给 cc 子对话
+# 装上跨会话工具），但它挂在 host composition 上、整个进程只挂载一次，
+# 因此与 preset 里的 per-session provider 不同，不需要 isolate realm——
+# 这与 claude-in-dsh 发布 ccmodeControl 的方式一致。
+- insert:
+    - id: dsh-agent-mesh
+      name: 'dsh-agent-mesh'

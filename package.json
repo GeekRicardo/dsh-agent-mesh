@@ -1,0 +1,37 @@
+{
+  "name": "dsh-agent-mesh",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness 插件：让一个会话开、驱动、审批、配置其它会话，全部走 dsh 原生渲染。dsh↔dsh 与 cc↔dsh 皆可，跨会话协议在 A2A（默认）与 MCP 间可切。cc 依赖软加载：没装 claude-in-dsh 时只支持 dsh 子对话。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
+    "install.sh"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && node --test test/*.test.mjs"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GeekRicardo/dsh-agent-mesh"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "dsh-agent-mesh",
+  "description": "一个会话开/驱动/审批/配置其它会话，全部走 dsh 原生渲染；dsh↔dsh 与 cc↔dsh，跨会话协议 A2A（默认）/ MCP 可切",
+  "version": "0.2.0",
+  "entry": {
+    "name": "dsh-agent-mesh",
+    "inject": [
+      "webServer",
+      "subprocess",
+      "timer"
+    ]
+  }
+}
