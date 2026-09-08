@@ -1052,3 +1052,20 @@ test('被挂起的子对话是停着的，它的通知不排在合并窗口后�
   assert.match(call, /\), true\)/, 'park 的通知必须标成紧急，否则一个被卡住的子对话要等满合并窗口')
   assert.match(source, /urgent === true \? 250 : 3000/, '紧急通知用更短的窗口')
 })
+
+// 等网关这件事没有「等够了」这一说。以前是等 60 次就永久放弃：整个 dsh 运行期
+// 里没有工具、没有 MCP 路由、没有审批桥，主对话就是开不出子对话，日志里只有一行
+// 「cannot open conversations」。60 秒听着很宽裕，直到机器忙起来——那台 Mac 并行
+// 跑着十个 rustc、负载 80，dsh 光启动就要好几分钟，插件早就退场了。
+test('网关来得再晚也等：过了快轮询窗口之后，工具依然会挂上', async () => {
+  const bench = harnessBench({ gateway: 'late' })
+  assert.deepEqual(bench.registered, [], '网关没来之前什么都不注册')
+  // 撑过 60 次快轮询（测试里每次 20ms），也就是老代码放弃的那个点。
+  await new Promise((resolve) => setTimeout(resolve, 1500))
+  assert.deepEqual(bench.registered, [], '还没来就还是什么都没有——但不该是「放弃了」')
+  bench.openGateway()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.equal(bench.registered.length, 10, '网关一出现，工具就该挂上——哪怕它迟到了很久')
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  assert.ok(bench.sessions.has(opened.childId), '迟到的网关一样能开出子对话')
+})
