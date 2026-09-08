@@ -931,3 +931,23 @@ test('载荷只带 agent.id 时也认得出是哪个子对话', async () => {
   }, () => { fellThrough = true; return Promise.resolve({ answers: [] }) })
   assert.equal(fellThrough, false, '只有 id 也该认出来，否则又是静默失效')
 })
+
+// token 曾经是「先随机、再被注册表替换」。插件重载得很频繁（实测一次 dsh
+// 运行里激活了 19 次），于是每次激活都短暂持有一把自己的随机 token：
+// 用某一次的 token 启动的 Claude 进程，撞上另一次的校验就永远 401——
+// 症状只是那个对话里 mesh 工具悄悄消失了。
+test('token 从注册表来，不是每次激活随机一把', () => {
+  const source = fs.readFileSync(new URL('../src/mesh.dynamic.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /let wireToken = randomToken\(\)/,
+    '不能以随机值开始服务——那样每次重载都会把在跑的子对话踢掉')
+  assert.match(source, /let wireToken = REMOTE_TOKEN/,
+    '起点应是环境变量（没有则为空），真正的值由注册表填')
+})
+
+test('还没读到 token 时明确答 503，而不是拿随机值去比', () => {
+  const source = fs.readFileSync(new URL('../src/mesh.dynamic.js', import.meta.url), 'utf8')
+  const guard = source.indexOf("if (wireToken.length === 0) {")
+  const compare = source.indexOf("if (authorization !== 'Bearer ' + wireToken)")
+  assert.ok(guard !== -1 && guard < compare,
+    '未就绪的判断必须在比对之前——否则空 token 会把所有请求都判成 401')
+})
