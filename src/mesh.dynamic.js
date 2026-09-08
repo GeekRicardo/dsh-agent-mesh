@@ -813,9 +813,10 @@ return {
         pending.set(requestId, entry)
         console.log('agent-mesh: parking', entry.kind, entry.toolName, 'from', child.childId, 'as', requestId,
           '— waiting for', child.parentId)
+        entry.requestId = requestId
         queueNotice(child, entry.kind === 'question'
           ? noticeForQuestion(child, requestId, entry)
-          : noticeForApproval(child, requestId, entry))
+          : noticeForApproval(child, requestId, entry), true)
         a2aOnParked(child, requestId, entry)
         if (request.signal !== undefined) {
           try { request.signal.addEventListener('abort', () => entry.settle('cancelled'), { once: true }) } catch (error) { /* older signal */ }
@@ -1074,7 +1075,7 @@ return {
       } catch (error) { console.error('agent-mesh: webhook to', url, 'failed:', errorText(error)) }
     }
 
-    function queueNotice(child, text) {
+    function queueNotice(child, text, urgent) {
       if (child.notify === 'off') return
       const parentId = child.parentId
       if (parentId.length === 0 || parentId === child.childId) return
@@ -1103,11 +1104,21 @@ return {
         deliverNotices(parentId).catch(failed)
         return
       }
-      if (deliveries.has(parentId)) return
+      // A parked child is STOPPED until the parent hears about it, so its
+      // notice does not wait out the batching window an ordinary "I finished a
+      // turn" notice can afford. Long enough to still coalesce a burst of
+      // questions, short enough not to read as the mesh ignoring the child.
+      const wait = urgent === true ? 250 : 3000
+      const armed = deliveries.get(parentId)
+      if (armed !== undefined) {
+        if (urgent !== true) return
+        deliveries.delete(parentId)
+        armed()
+      }
       deliveries.set(parentId, armTimeout(() => {
         deliveries.delete(parentId)
         deliverNotices(parentId).catch(failed)
-      }, 3000))
+      }, wait))
     }
 
     function drainNotices(parentId) {
@@ -1135,8 +1146,18 @@ return {
         })
         console.log('agent-mesh: notified', parentId, 'about', queued.length, 'child event(s)', running ? '(steered)' : '(woke)')
       } catch (error) {
-        // Put it back rather than losing it — the parent may just be busy.
+        // Put it back rather than losing it — the parent may just be busy — and
+        // arm a retry, because nothing else will. Without one the notice sat in
+        // the queue until some LATER child event happened to push it out, which
+        // for a child blocked on a question is never.
         notices.set(parentId, (notices.get(parentId) || []).concat(queued))
+        if (!deliveries.has(parentId)) {
+          deliveries.set(parentId, armTimeout(() => {
+            deliveries.delete(parentId)
+            deliverNotices(parentId).catch((again) =>
+              console.error('agent-mesh: could not notify', parentId + ':', errorText(again)))
+          }, 3000))
+        }
         throw error
       }
     }
@@ -1183,9 +1204,44 @@ return {
         + '或 agent_approve requestId=' + requestId + ' decision=deny 表示不回答让它自己继续。'
     }
 
+    /**
+     * Tell a parent again about the children still parked on it, now that its
+     * turn has ended.
+     *
+     * A notice delivered into a RUNNING parent is steered into the turn already
+     * in flight, and a steer can be lost: the turn ends between the moment the
+     * parent looked idle-or-running and the moment dsh handles the prompt, and
+     * a next-step message with no turn to join has nobody to read it. The child
+     * is then blocked forever on a question its parent was told about exactly
+     * once, in a turn that is over. A fresh turn cannot be lost that way, so the
+     * reminder goes out as one — the parent is idle now, which is precisely why
+     * this is the moment to ask again.
+     *
+     * Once per request. A parent that ignores the second notice has decided,
+     * and a third would only spend turns saying the same thing.
+     */
+    function remindParent(parentId) {
+      if (typeof parentId !== 'string' || parentId.length === 0) return
+      for (const [requestId, entry] of pending) {
+        if (entry.reminded === true) continue
+        const child = children.get(entry.childId)
+        if (child === undefined || child.parentId !== parentId) continue
+        entry.reminded = true
+        console.log('agent-mesh: reminding', parentId, 'about', entry.kind, 'from', entry.childId,
+          '(' + requestId + ') — its turn ended without answering')
+        queueNotice(child, entry.kind === 'question'
+          ? noticeForQuestion(child, requestId, entry)
+          : noticeForApproval(child, requestId, entry), true)
+      }
+    }
+
     function watchChildren() {
       return ctx.on('session/event', (session, event) => {
         if (event.type !== 'turn/end') return
+        // This session may be a PARENT rather than a child: a turn ending with
+        // one of its children still parked is the signal that a mid-turn notice
+        // never landed.
+        remindParent(session.id)
         const child = children.get(session.id)
         if (child === undefined) return
         const reason = event.data === undefined ? undefined : event.data.reason

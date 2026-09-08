@@ -56,6 +56,8 @@ function harnessBench(options = {}) {
       },
       prompt(request) {
         const { sessionId, mode, content } = request.payload
+        // 让测试能让某一次投递失败：真实里 steer 会输给「这一轮刚好结束了」。
+        if (options.onPrompt !== undefined) options.onPrompt({ sessionId, mode })
         prompts.push({ sessionId, mode, text: content.map(part => part.text).join('') })
         // A cold conversation is resumed by the real prompt path; the bench
         // simulates that by materializing the session on demand.
@@ -106,6 +108,8 @@ function harnessBench(options = {}) {
         throw new Error('0.1.2 要求调用方自己给 requestId')
       }
       const { sessionId, mode, content } = request
+      // 让测试能让某一次投递失败：真实里 steer 会输给「这一轮刚好结束了」。
+      if (options.onPrompt !== undefined) options.onPrompt({ sessionId, mode })
       prompts.push({ sessionId, mode, text: content.map(part => part.text).join('') })
       const session = sessions.get(sessionId) ?? makeSession(sessionId, '/work')
       session.push('turn/start', { turn: 1 })
@@ -950,4 +954,101 @@ test('还没读到 token 时明确答 503，而不是拿随机值去比', () => 
   const compare = source.indexOf("if (authorization !== 'Bearer ' + wireToken)")
   assert.ok(guard !== -1 && guard < compare,
     '未就绪的判断必须在比对之前——否则空 token 会把所有请求都判成 401')
+})
+
+// ---------- 插进正在跑的那一轮，可能根本没被读到 ----------
+//
+// 主对话在跑的时候，子对话的提问是 steer 进那一轮的。steer 会输给一个竞态：
+// 「在跑」是看日志判断的，等 dsh 真的处理这条 prompt 时那一轮可能已经结束，
+// 而一条 next-step 消息在没有 turn 的时候没人读。子对话于是永远卡在一个
+// 「已经通知过一次、但那一次落在了一轮已经结束的对话里」的提问上。
+
+/** 主对话自己那一轮结束时 dsh 追加的 turn/end。 */
+function endParentTurn(bench, parentId = 'parent-1') {
+  const session = bench.sessions.get(parentId)
+  session.push('turn/end', { turn: 9, reason: { kind: 'completed' } })
+  for (const listener of bench.listeners['session/event'] ?? []) listener(session, session.events.at(-1))
+}
+
+function askFrom(bench, childId) {
+  const listener = bench.listeners['userQuestions/request'][0]
+  return listener({
+    agent: { session: bench.sessions.get(childId) },
+    questions: [{ id: 'q1', header: 'Env', question: '选哪个环境？', options: [{ label: 'staging' }, { label: 'prod' }] }],
+  }, () => Promise.resolve({ answers: [] }))
+}
+
+test('插进去的提问那一轮结束还没被回答，就用新的一轮再问一次', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  bench.sessions.get('parent-1').push('turn/start', { turn: 9 })
+
+  const answering = askFrom(bench, opened.childId)
+  await settled()
+  assert.equal(bench.prompts.at(-1).mode, 'steer', '主对话在跑，先插队试一次')
+
+  const before = bench.prompts.length
+  endParentTurn(bench)
+  await settled()
+  assert.equal(bench.prompts.length, before + 1, '问题还挂着，就得再问一次')
+  assert.equal(bench.prompts.at(-1).mode, 'queue', '这次要用新的一轮——插队会再丢一次')
+  assert.match(bench.prompts.at(-1).text, /req-1/)
+
+  await bench.call('agent_answer', { requestId: 'req-1', answers: [{ id: 'q1', selected: ['prod'] }] })
+  assert.deepEqual(await answering, { answers: [{ id: 'q1', selected: ['prod'] }] })
+})
+
+test('已经回答过的提问，主对话那一轮结束时不会再被打扰', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  bench.sessions.get('parent-1').push('turn/start', { turn: 9 })
+  const answering = askFrom(bench, opened.childId)
+  await settled()
+  await bench.call('agent_answer', { requestId: 'req-1', answers: [{ id: 'q1', selected: ['prod'] }] })
+  await answering
+
+  const before = bench.prompts.length
+  endParentTurn(bench)
+  await settled()
+  assert.equal(bench.prompts.length, before, '答完了就没什么可提醒的了')
+})
+
+test('只提醒一次：主对话忽略第二次就是它的决定，第三次只是白烧一轮', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  bench.sessions.get('parent-1').push('turn/start', { turn: 9 })
+  askFrom(bench, opened.childId)
+  await settled()
+
+  endParentTurn(bench)
+  await settled()
+  const afterFirst = bench.prompts.length
+  endParentTurn(bench)
+  await settled()
+  assert.equal(bench.prompts.length, afterFirst, '提醒过一次就够了')
+})
+
+test('投递失败的通知会自己重试，而不是烂在队列里等下一个事件', async () => {
+  let fail = true
+  const bench = harnessBench({
+    onPrompt: ({ sessionId }) => {
+      if (fail && sessionId === 'parent-1') { fail = false; throw new Error('这一轮刚好结束了') }
+    },
+  })
+  const opened = await bench.call('agent_open', { engine: 'dsh', approvals: 'parent' })
+  const before = bench.prompts.length
+  askFrom(bench, opened.childId)
+  await settled()
+  await settled()
+  const notices = bench.prompts.slice(before).filter((p) => p.sessionId === 'parent-1')
+  assert.equal(notices.length, 1, '第一次投递抛了，重试必须把它送到')
+  assert.match(notices[0].text, /req-1/)
+})
+
+test('被挂起的子对话是停着的，它的通知不排在合并窗口后面', () => {
+  const source = fs.readFileSync(path.join(root, 'src/mesh.dynamic.js'), 'utf8')
+  const park = source.slice(source.indexOf('function park(child, request)'))
+  const call = park.slice(0, park.indexOf('a2aOnParked'))
+  assert.match(call, /\), true\)/, 'park 的通知必须标成紧急，否则一个被卡住的子对话要等满合并窗口')
+  assert.match(source, /urgent === true \? 250 : 3000/, '紧急通知用更短的窗口')
 })
