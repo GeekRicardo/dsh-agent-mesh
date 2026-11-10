@@ -145,6 +145,7 @@ function harnessBench(options = {}) {
   }
 
   const services = {
+    ...options.services,
     ...(options.dsh === '0.1.2' ? { sessionController, workspaceRegistry } : { apiProxy }),
     agents: {
       get: (id) => (sessions.has(id) ? { id, session: sessions.get(id) } : undefined),
@@ -266,7 +267,7 @@ test('every operation reaches the model as a tool', () => {
   const bench = harnessBench()
   assert.deepEqual(bench.registered.map(tool => tool.name).sort(), [
     'agent_answer', 'agent_approve', 'agent_config', 'agent_list', 'agent_open', 'agent_read', 'agent_send',
-    'agent_stop', 'agent_workspaces', 'claude_usage',
+    'agent_stop', 'agent_wait', 'agent_workspaces', 'claude_usage',
   ])
 })
 
@@ -297,11 +298,15 @@ test('an unknown permission preset is refused before any conversation exists', a
   assert.equal(bench.sessions.size, 1, 'no stray child was created')
 })
 
-test('sending reads back only what happened after the prompt', async () => {
+test('sending never skips what the parent has not read yet', async () => {
+  // The cursor used to jump to "now" on every send. A round the child ran on
+  // its own (a background task finished) between the parent's last read and
+  // its next send was then never readable — the turn notice only carries the
+  // last paragraph and tells the parent to agent_read for the rest.
   const bench = harnessBench()
   const opened = await bench.call('agent_open', { engine: 'dsh' })
   const child = bench.sessions.get(opened.childId)
-  child.push('assistant/message', { turn: 0, step: 0, message: { content: [{ type: 'text', text: 'earlier' }] } })
+  child.push('assistant/message', { turn: 0, step: 0, message: { content: [{ type: 'text', text: 'unread-before-send' }] } })
 
   const sent = await bench.call('agent_send', { childId: opened.childId, text: 'hello', wait: false })
   assert.deepEqual(bench.prompts.at(-1), { sessionId: opened.childId, mode: 'queue', text: 'hello' })
@@ -310,10 +315,17 @@ test('sending reads back only what happened after the prompt', async () => {
   child.push('turn/end', { turn: 1, reason: { kind: 'blocked' } })
 
   const read = await bench.call('agent_read', { childId: opened.childId })
+  assert.match(read.report, /unread-before-send/)
   assert.match(read.report, /later/)
-  assert.doesNotMatch(read.report, /earlier/)
   assert.match(read.report, /turn 1 done/)
   assert.ok(sent.report.length > 0)
+
+  // What has been read stays read: the next send does not replay it.
+  child.push('assistant/message', { turn: 2, step: 0, message: { content: [{ type: 'text', text: 'third' }] } })
+  await bench.call('agent_send', { childId: opened.childId, text: 'again', wait: false })
+  const next = await bench.call('agent_read', { childId: opened.childId })
+  assert.match(next.report, /third/)
+  assert.doesNotMatch(next.report, /unread-before-send|later/)
 })
 
 test('dsh scaffolding stays out of the read unless it is asked for', async () => {
@@ -419,7 +431,7 @@ test('the half waits for the API gateway instead of idling when it applies first
   assert.deepEqual(bench.registered, [], 'nothing is registered against a gateway that is not there yet')
   bench.openGateway()
   await new Promise(resolve => setTimeout(resolve, 60))
-  assert.equal(bench.registered.length, 10, 'the tools appear once the gateway does')
+  assert.equal(bench.registered.length, 11, 'the tools appear once the gateway does')
   const opened = await bench.call('agent_open', { engine: 'dsh' })
   assert.ok(bench.sessions.has(opened.childId))
 })
@@ -631,6 +643,41 @@ test('a mid-turn Claude child is never evicted for the budget', async () => {
   const c = await bench.call('agent_open', { engine: 'claude' })
   await bench.call('agent_send', { childId: c.childId, text: 'go', wait: false })
   assert.deepEqual(bench.stopped, [], 'no idle child existed to evict; running ones are left alone')
+})
+
+test('a child whose Claude still has background work is never evicted — the work would die with it', async () => {
+  // Measured: a child started a background build and ended its turn; another
+  // child's turn evicted it as "idle", and the build died with the process
+  // ("didn't finish before the previous session ended") — no wake, no result.
+  const bench = harnessBench()
+  const a = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: a.childId, text: 'go', wait: false })
+  endTurn(bench, a.childId)
+  bench.claudeState.set(a.childId, { ...bench.claudeState.get(a.childId), resident: true, backgroundTasks: 1 })
+  const b = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: b.childId, text: 'go', wait: false })
+  endTurn(bench, b.childId)
+  bench.claudeState.set(b.childId, { ...bench.claudeState.get(b.childId), resident: true, backgroundTasks: 0 })
+  const c = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: c.childId, text: 'go', wait: false })
+  assert.deepEqual(bench.stopped, [b.childId], 'the busy one is skipped; the next idle one goes')
+})
+
+test('only children with a resident process count against the budget', async () => {
+  // Already-stopped children stayed "resident" forever under the old rule, so
+  // every turn tried to stop them again and evicted a live one besides.
+  const bench = harnessBench()
+  const a = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: a.childId, text: 'go', wait: false })
+  endTurn(bench, a.childId)
+  bench.claudeState.set(a.childId, { ...bench.claudeState.get(a.childId), resident: false })
+  const b = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: b.childId, text: 'go', wait: false })
+  endTurn(bench, b.childId)
+  bench.claudeState.set(b.childId, { ...bench.claudeState.get(b.childId), resident: true })
+  const c = await bench.call('agent_open', { engine: 'claude' })
+  await bench.call('agent_send', { childId: c.childId, text: 'go', wait: false })
+  assert.deepEqual(bench.stopped, [], 'a is not resident, so b and c fit the budget of 2')
 })
 
 // ---------- A2A task lifecycle ----------
@@ -1047,7 +1094,7 @@ test('投递失败的通知会自己重试，而不是烂在队列里等下一�
 
 test('被挂起的子对话是停着的，它的通知不排在合并窗口后面', () => {
   const source = fs.readFileSync(path.join(root, 'src/mesh.dynamic.js'), 'utf8')
-  const park = source.slice(source.indexOf('function park(child, request)'))
+  const park = source.slice(source.indexOf('function announceParked(child, requestId, entry, tries)'))
   const call = park.slice(0, park.indexOf('a2aOnParked'))
   assert.match(call, /\), true\)/, 'park 的通知必须标成紧急，否则一个被卡住的子对话要等满合并窗口')
   assert.match(source, /urgent === true \? 250 : 3000/, '紧急通知用更短的窗口')
@@ -1065,7 +1112,200 @@ test('网关来得再晚也等：过了快轮询窗口之后，工具依然会�
   assert.deepEqual(bench.registered, [], '还没来就还是什么都没有——但不该是「放弃了」')
   bench.openGateway()
   await new Promise((resolve) => setTimeout(resolve, 200))
-  assert.equal(bench.registered.length, 10, '网关一出现，工具就该挂上——哪怕它迟到了很久')
+  assert.equal(bench.registered.length, 11, '网关一出现，工具就该挂上——哪怕它迟到了很久')
   const opened = await bench.call('agent_open', { engine: 'dsh' })
   assert.ok(bench.sessions.has(opened.childId), '迟到的网关一样能开出子对话')
+})
+
+test('请求 id 跨 dsh 重启也不重号——0.2 会把撞号的 prompt 当重试静默吞掉', () => {
+  const slice = (name) => {
+    const start = body.indexOf(`function ${name}(`)
+    let depth = 0
+    for (let i = body.indexOf('{', start); i < body.length; i += 1) {
+      if (body[i] === '{') depth += 1
+      else if (body[i] === '}' && --depth === 0) return body.slice(start, i + 1)
+    }
+  }
+  // 每次 new Function 就是一次「重启」：模块状态全新。
+  const boot = () => new Function(`${slice('randomToken')}\n${slice('rpcId')}\nreturn rpcId`)()
+  const before = boot()('prompt')
+  const after = boot()('prompt')
+  assert.notEqual(before, after)
+  assert.match(before, /^agent-mesh-prompt-/)
+})
+
+// ---------- 外部父对话与审批内容（0.2.1） ----------
+
+/** 让 prompt 对不存在的会话报错——真实 dsh 里外部 handle 就是这个下场。 */
+function unknownSessionBench() {
+  const attempts = []
+  const bench = harnessBench({
+    onPrompt({ sessionId }) {
+      if (sessionId === 'cc-linux') { attempts.push(sessionId); throw new Error('session "cc-linux" not found') }
+    },
+  })
+  return { bench, attempts }
+}
+
+test('外部 handle 当父对话：投递失败一次就停，不会每 3 秒重试到天荒地老', async () => {
+  const { bench, attempts } = unknownSessionBench()
+  const opened = await bench.control().run('agent_open', 'cc-linux', { engine: 'dsh' })
+  endTurn(bench, opened.childId, { kind: 'completed' })
+  await new Promise(resolve => setTimeout(resolve, 3400))
+  assert.equal(attempts.length, 1, '确认它不是会话之后就不该再试')
+  const listed = await bench.control().run('agent_list', 'cc-linux', {})
+  assert.match(listed.report, /跑完了这一轮/, '通知攒着，下一次调用带回去，一条都不丢')
+})
+
+test('外部 handle 开子对话时会被明确告知没人能叫醒它', async () => {
+  const { bench } = unknownSessionBench()
+  const opened = await bench.control().run('agent_open', 'cc-linux', { engine: 'dsh' })
+  assert.match(opened.report, /external handle/)
+  assert.match(opened.report, /agent_wait/)
+  const inside = await bench.call('agent_open', { engine: 'dsh' })
+  assert.doesNotMatch(inside.report, /external handle/)
+})
+
+test('审批通知带上调用参数，父对话才知道自己在批什么', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  session.push('tool/call', { callId: 'c9', name: 'bash', arguments: '{"command":"rm -rf /tmp/x"}' })
+  const listener = bench.listeners['approval/request'][0]
+  listener({ agent: { session }, toolName: 'bash', reason: 'wants shell', callId: 'c9' }, () => Promise.resolve('unavailable'))
+  await settled()
+  await new Promise(resolve => setTimeout(resolve, 300))
+  const told = bench.prompts.find(entry => entry.sessionId === 'parent-1')
+  assert.match(told.text, /rm -rf \/tmp\/x/)
+  assert.match(told.text, /agent_approve requestId=req-1/)
+})
+
+test('提问通知带上详情和计划审核语义，agent_read 也能看到全文', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  const listener = bench.listeners['user-questions/request'][0]
+  listener({ agent: { session }, questions: [{ id: 'q', header: '计划', question: '批准吗', detail: '第一步改 A',
+    intent: { kind: 'plan-review', approve: '批准' }, options: [{ label: '批准' }, { label: '再想想' }] }] }, () => Promise.reject(new Error('no')))
+  const read = await bench.call('agent_read', { childId: opened.childId })
+  assert.match(read.report, /第一步改 A/)
+  assert.match(read.report, /选「批准」表示批准/)
+})
+
+test('agent_send 一段文字就能答提问：子对话不再傻等，也不用非走 agent_answer', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  const listener = bench.listeners['user-questions/request'][0]
+  const asked = listener({ agent: { session }, questions: [{ id: 'color', question: 'Which?', options: [{ label: 'Red' }] }] }, () => Promise.reject(new Error('no')))
+  const free = await bench.call('agent_send', { childId: opened.childId, text: '都不要，用绿色', wait: false })
+  assert.match(free.report, /Answered req-1/)
+  assert.deepEqual(await asked, { answers: [{ id: 'color', selected: [], custom: '都不要，用绿色' }] })
+
+  const again = listener({ agent: { session }, questions: [{ id: 'color', question: 'Which?', options: [{ label: 'Red' }] }] }, () => Promise.reject(new Error('no')))
+  await bench.call('agent_send', { childId: opened.childId, text: 'Red', wait: false })
+  assert.deepEqual(await again, { answers: [{ id: 'color', selected: ['Red'] }] }, '正好是选项标签就算选中')
+})
+
+test('agent_send 不会替审批做主：卡在权限上的子对话不因为一句话被放行', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  const listener = bench.listeners['approval/request'][0]
+  let outcome
+  listener({ agent: { session }, toolName: 'bash', callId: 'c' }, () => Promise.resolve('unavailable')).then(value => { outcome = value })
+  await bench.call('agent_send', { childId: opened.childId, text: '可以，放行吧', wait: false })
+  await settled()
+  assert.equal(outcome, undefined, '放行只能走 agent_approve')
+})
+
+test('agent_wait 立刻返回等着的事，没活时也不空等', async () => {
+  const { bench } = unknownSessionBench()
+  const idle = await bench.control().run('agent_wait', 'cc-linux', { timeoutSeconds: 30 })
+  assert.equal(idle.outcome, 'nothing-running')
+  const opened = await bench.control().run('agent_open', 'cc-linux', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  bench.listeners['approval/request'][0]({ agent: { session }, toolName: 'bash', reason: 'needs it' }, () => Promise.resolve('unavailable'))
+  const news = await bench.control().run('agent_wait', 'cc-linux', { timeoutSeconds: 30 })
+  assert.equal(news.outcome, 'news')
+  assert.match(news.report, /req-1/)
+})
+
+test('两份核心不打架：已有 multiagentControl 时这一份不注册工具', () => {
+  const bench = harnessBench({ services: { multiagentControl: {} } })
+  assert.equal(bench.registered.length, 0)
+})
+
+test('指定项目开子对话时，记录的工作目录是那个项目的，不是父对话的', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh', workspaceId: 'ws-1' })
+  assert.equal(opened.status.cwd, '/work')
+  const sessions = bench.sessions.get('parent-1')
+  sessions.header.cwd = '/elsewhere'
+  const again = await bench.call('agent_open', { engine: 'dsh', workspaceId: 'ws-1' })
+  assert.equal(again.status.cwd, '/work', '父对话在别的目录也不影响')
+})
+
+test('Claude 子对话的审批先于转录到达：等一下调用记录，通知里才有参数', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  bench.listeners['approval/request'][0]({ agent: { session }, toolName: 'bash', callId: 'late' }, () => Promise.resolve('unavailable'))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  session.push('tool/call', { callId: 'late', name: 'bash', arguments: '{"command":"make deploy"}' })
+  await new Promise(resolve => setTimeout(resolve, 700))
+  assert.match(bench.prompts.find(entry => entry.sessionId === 'parent-1').text, /make deploy/)
+})
+
+test('调用记录一直不来也不能把通知憋死', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  bench.listeners['approval/request'][0]({ agent: { session: bench.sessions.get(opened.childId) }, toolName: 'bash', callId: 'never' }, () => Promise.resolve('unavailable'))
+  await new Promise(resolve => setTimeout(resolve, 2000))
+  assert.match(bench.prompts.find(entry => entry.sessionId === 'parent-1').text, /req-1/)
+})
+
+test('agent_wait 里同一个请求只说一次', async () => {
+  const bench = harnessBench({ onPrompt({ sessionId }) { if (sessionId === 'cc-linux') throw new Error('session "cc-linux" not found') } })
+  const opened = await bench.control().run('agent_open', 'cc-linux', { engine: 'dsh' })
+  bench.listeners['approval/request'][0]({ agent: { session: bench.sessions.get(opened.childId) }, toolName: 'bash', reason: 'x' }, () => Promise.resolve('unavailable'))
+  await new Promise(resolve => setTimeout(resolve, 50))
+  const news = await bench.control().run('agent_wait', 'cc-linux', { timeoutSeconds: 5 })
+  assert.equal(news.report.match(/卡在一个权限请求/g).length, 1)
+})
+
+test('拒绝审批的理由会告诉子对话，并说明不是用户本人拒的', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const decided = bench.listeners['approval/request'][0]({ agent: { session: bench.sessions.get(opened.childId) }, toolName: 'bash' }, () => Promise.resolve('unavailable'))
+  await bench.call('agent_approve', { requestId: 'req-1', decision: 'deny', reason: '命令会打印环境变量' })
+  assert.equal(await decided, 'rejected')
+  await settled()
+  const told = bench.prompts.find(entry => entry.sessionId === opened.childId)
+  assert.equal(told.mode, 'steer')
+  assert.match(told.text, /不是用户本人/)
+  assert.match(told.text, /命令会打印环境变量/)
+})
+
+test('不写理由就不多发消息；放行也不发', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  bench.listeners['approval/request'][0]({ agent: { session }, toolName: 'bash' }, () => Promise.resolve('unavailable'))
+  await bench.call('agent_approve', { requestId: 'req-1', decision: 'deny' })
+  bench.listeners['approval/request'][0]({ agent: { session }, toolName: 'bash' }, () => Promise.resolve('unavailable'))
+  await bench.call('agent_approve', { requestId: 'req-2', decision: 'allow', reason: 'ok' })
+  await settled()
+  assert.equal(bench.prompts.filter(entry => entry.sessionId === opened.childId).length, 0)
+})
+
+test('send 带图：dsh 子对话进 prompt；答提问时图跟在答案后面', async () => {
+  const bench = harnessBench()
+  const opened = await bench.call('agent_open', { engine: 'dsh' })
+  const session = bench.sessions.get(opened.childId)
+  const asked = bench.listeners['user-questions/request'][0]({ agent: { session }, questions: [{ id: 'q', question: 'x' }] }, () => Promise.reject(new Error('no')))
+  assert.ok(asked)
+  const body = fs.readFileSync(path.join(root, 'src/mesh.dynamic.js'), 'utf8')
+  assert.match(body, /async function send\(child, text, mode, wait, timeoutSeconds, prefix, images\)/)
+  assert.match(body, /上面回答附带的图片/)
 })

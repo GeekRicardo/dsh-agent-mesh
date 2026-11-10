@@ -93,6 +93,21 @@ return {
     const notices = new Map()
     /** In-flight debounce per parent, so five children finishing at once cost one turn. */
     const deliveries = new Map()
+    /**
+     * Parents dsh has confirmed are not sessions (an external MCP driver's fixed
+     * handle). Prompting them can never succeed, so their notices simply wait for
+     * the next agent_* call; retrying used to fail every 3 s for the life of dsh.
+     */
+    const unreachableParents = new Set()
+    /** parentId → notices handed to a turn that has not ended yet. */
+    const unconfirmed = new Map()
+    const MAX_NOTICE_RETRIES = 8
+    /** Worded by claude-in-dsh. If it ever changes, a failed turn just reads as an ordinary one again. */
+    const ENGINE_TURN_FAILED = '⚠ Claude Code 这一轮失败了：'
+    /** Under the 25 seconds claude-in-dsh's hop allows, so a slow answer comes back as an answer. */
+    const HOP_SAFE_WAIT_SECONDS = 20
+    /** Consecutive delivery failures per parent, for the retry backoff. */
+    const deliveryFailures = new Map()
     let requestCounter = 0
 
     const STATE_DIR = '"$HOME"/.cache/dsh-agent-mesh'
@@ -120,10 +135,13 @@ return {
       return new Promise((resolve) => { armTimeout(resolve, ms) })
     }
 
-    let rpcCounter = 0
+    // A request id must be unique for the life of the session LOG, not of this
+    // process: dsh 0.2 treats a prompt whose rpcId any earlier user message
+    // already carries as a retry and answers `accepted` without delivering it.
+    // A per-process counter restarts at 1 with every dsh restart, so each
+    // agent_send after one collided with a pre-restart prompt and vanished.
     function rpcId(prefix) {
-      rpcCounter += 1
-      return 'agent-mesh-' + prefix + '-' + rpcCounter
+      return 'agent-mesh-' + prefix + '-' + Date.now().toString(36) + '-' + randomToken().slice(0, 12)
     }
 
     function randomToken() {
@@ -133,6 +151,13 @@ return {
     }
 
     function nowMs() { return Date.now() }
+
+    /** A signal for a call nothing cancels. The dynamic sandbox has no AbortController. */
+    function neverAborted() {
+      return typeof AbortController === 'undefined'
+        ? { aborted: false, reason: undefined, addEventListener() {}, removeEventListener() {}, onabort: null, throwIfAborted() {} }
+        : new AbortController().signal
+    }
 
     function runCapture(argv, timeoutMs) {
       return new Promise((resolve) => {
@@ -149,10 +174,11 @@ return {
             graceMs: 2000,
           })
         } catch (error) { finish(''); return }
-        ;(async () => {
+        const drained = (async () => {
           try { for await (const chunk of proc.stdout) output += String(chunk) } catch (error) { /* closed */ }
         })()
-        proc.done.then(() => finish(output), () => finish(output))
+        // Exit is not end of output: answering at exit could hand back half a file.
+        Promise.all([drained, proc.done.catch(() => undefined)]).then(() => finish(output))
         armTimeout(() => { try { proc.terminate() } catch (error) { /* gone */ } finish(output) }, timeoutMs || 10000)
       })
     }
@@ -169,6 +195,8 @@ return {
             parentId: child.parentId,
             engine: child.engine,
             cwd: child.cwd,
+            remote: child.remote,
+            remoteCwd: child.remoteCwd,
             approvals: child.approvals,
             notify: child.notify,
             cursor: child.cursor,
@@ -217,6 +245,8 @@ return {
           parentId: String(entry.parentId || ''),
           engine: entry.engine === 'dsh' ? 'dsh' : 'claude',
           cwd: typeof entry.cwd === 'string' ? entry.cwd : '',
+          ...(typeof entry.remote === 'string' ? { remote: entry.remote } : {}),
+          ...(typeof entry.remoteCwd === 'string' ? { remoteCwd: entry.remoteCwd } : {}),
           approvals: ['parent', 'human', 'allow', 'deny'].indexOf(entry.approvals) >= 0 ? entry.approvals : 'parent',
           notify: entry.notify === 'off' ? 'off' : 'wake',
           blockingWait: false,
@@ -267,7 +297,7 @@ return {
           // 0.1.2 requires the caller to mint the request id the old proxy
           // minted for it.
           { requestId: rpcId('prompt'), ...payload },
-          signal === undefined ? new AbortController().signal : signal),
+          signal === undefined ? neverAborted() : signal),
         history: async (payload) => {
           // `page()` wants an address plus a `throughSeq` from a follow frame.
           // A host plugin holding the agent does not need either — it reads the
@@ -471,6 +501,8 @@ return {
         childId: child.childId,
         engine: child.engine,
         cwd: child.cwd,
+        ...(child.remote === undefined ? {} : { remote: child.remote }),
+        ...(child.remoteCwd === undefined ? {} : { remoteCwd: child.remoteCwd }),
         title: session === undefined ? '' : titleOf(sessionEvents(session)),
         live: session !== undefined,
         running: isRunning(child.childId),
@@ -487,10 +519,21 @@ return {
       try { return permissionPresets.current(sessionEvents(session)) } catch (error) { return undefined }
     }
 
+    /** Where the engine put a child, or undefined when this engine does not say. */
+    function safeLanding(childId) {
+      try {
+        const state = ccmode.state(childId)
+        if (typeof state.remote !== 'string') return undefined
+        return { remote: state.remote, remoteCwd: typeof state.remoteCwd === 'string' ? state.remoteCwd : '' }
+      } catch (error) { return undefined }
+    }
+
     function safeClaudeState(childId) {
       try {
         const state = ccmode.state(childId)
-        return { mode: state.mode, model: state.model || state.route || '', effort: state.effort, permissionMode: state.permissionMode, running: state.running }
+        return { mode: state.mode, model: state.model || state.route || '', effort: state.effort, permissionMode: state.permissionMode,
+          running: state.running, resident: state.resident, backgroundTasks: state.backgroundTasks,
+          ...(state.quotaWait ? { quotaWait: state.quotaWait } : {}) }
       } catch (error) { return undefined }
     }
 
@@ -512,9 +555,14 @@ return {
       for (const child of children.values()) {
         if (child.engine !== 'claude') continue
         const state = ccmode === undefined ? undefined : safeClaudeState(child.childId)
-        // `running` means mid-turn; a resident-but-idle process still counts
-        // against the budget, which we detect through ccmode's live state.
-        if (state !== undefined && (state.running === true || state.mode === 'claude')) live.push(child)
+        // Only a process that is actually there counts. claude-in-dsh says so
+        // outright (`resident`); counting every Claude-mode child instead kept
+        // long-stopped ones on the books forever, so the budget always read
+        // "over" and evicted whichever live child happened to be idle. Older
+        // claude-in-dsh builds do not report it: fall back to the old rule.
+        if (state === undefined) continue
+        const resident = typeof state.resident === 'boolean' ? state.resident : state.mode === 'claude'
+        if (state.running === true || resident) live.push(child)
       }
       return live
     }
@@ -529,8 +577,12 @@ return {
       const live = liveClaudeChildren().filter((child) => child.childId !== keepChildId)
       // Count the one we are about to run as resident.
       if (live.length + 1 <= MAX_LIVE_CLAUDE) return
+      // Idle is not "between turns": a child whose Claude still has background
+      // work (a build, a test run it started and will report on) loses that
+      // work with the process — it never finishes and never wakes the child.
       const evictable = live
         .filter((child) => !isRunning(child.childId))
+        .filter((child) => { const state = safeClaudeState(child.childId); return !(state && state.backgroundTasks > 0) })
         .sort((a, b) => (a.lastActiveAt || 0) - (b.lastActiveAt || 0))
       let resident = live.length + 1
       for (const child of evictable) {
@@ -582,12 +634,17 @@ return {
       const askedWorkspace = typeof options.workspaceId === 'string' && options.workspaceId.length > 0
         ? options.workspaceId
         : undefined
+      let askedPath
       if (askedWorkspace !== undefined) {
         const known = (await api('workspace', 'list', {})).items
-          .some((entry) => entry.workspaceId === askedWorkspace)
-        if (!known) throw new Error('agent-mesh: no project with id ' + askedWorkspace + ' — see agent_workspaces')
+          .find((entry) => entry.workspaceId === askedWorkspace)
+        if (known === undefined) throw new Error('agent-mesh: no project with id ' + askedWorkspace + ' — see agent_workspaces')
+        askedPath = known.path
       }
-      const cwd = typeof options.cwd === 'string' && options.cwd.length > 0 ? options.cwd : cwdOf(parentId)
+      // A named project says where the child works: falling back to the parent's
+      // directory here recorded the wrong one on every child opened across projects.
+      const cwd = askedPath !== undefined ? askedPath
+        : typeof options.cwd === 'string' && options.cwd.length > 0 ? options.cwd : cwdOf(parentId)
       let workspaceId = askedWorkspace
       if (askedWorkspace !== undefined) {
         // An explicit project wins over any inherited or derived one.
@@ -610,6 +667,10 @@ return {
         parentId: parentId,
         engine: engine,
         cwd: cwd,
+        // A remote child's `cwd` only says which project it is filed under here.
+        ...(engine === 'claude' && typeof options.remote === 'string' && options.remote.length > 0
+          ? { remote: options.remote, ...(typeof options.remoteCwd === 'string' && options.remoteCwd.length > 0 ? { remoteCwd: options.remoteCwd } : {}) }
+          : {}),
         approvals: ['parent', 'human', 'allow', 'deny'].indexOf(options.approvals) >= 0 ? options.approvals : 'parent',
         notify: options.notify === 'off' ? 'off' : 'wake',
         blockingWait: false,
@@ -630,6 +691,17 @@ return {
           ccmode.setRemote(childId,
             typeof options.remote === 'string' ? options.remote : undefined,
             typeof options.remoteCwd === 'string' ? options.remoteCwd : undefined)
+        }
+        // Ask the engine where the child really landed: leaving `remote` out
+        // inherits the deployment default, and a project remembers its own
+        // directory on each target. Neither is visible from the options.
+        const landed = safeLanding(childId)
+        if (landed !== undefined && landed.remote.length > 0) {
+          child.remote = landed.remote
+          if (child.remoteCwd === undefined && landed.remoteCwd.length > 0) child.remoteCwd = landed.remoteCwd
+        } else if (landed !== undefined) {
+          delete child.remote
+          delete child.remoteCwd
         }
         ccmode.setPosture(childId, posture === undefined
           ? (child.approvals === 'human' || child.approvals === 'parent' ? 'manual' : 'acceptEdits')
@@ -654,9 +726,22 @@ return {
         }
       }
       persist()
+      if (extension !== undefined && typeof extension.onChildOpened === 'function') await extension.onChildOpened(child)
       console.log('agent-mesh:', parentId, 'opened', engine, 'child', childId, 'in', cwd || '(host cwd)')
-      warnUnreachableParent(parentId)
+      // A parent that asked not to be told has nothing to miss.
+      if (child.notify !== 'off') warnUnreachableParent(parentId)
+      // A cold session is not a handle: only something dsh has no record of is.
+      child.parentExternal = sessionOf(parentId) === undefined && !wireHooks.has(parentId)
+        && (await workspaceOf(parentId).catch(() => undefined)) === undefined
       return child
+    }
+
+    /** What an external parent has to be told, since the usual promise does not hold for it. */
+    function externalNote(child) {
+      return child.parentExternal === true
+        ? ' This conversation is an external handle, not a dsh session, so nothing can wake you:'
+          + ' call agent_wait (or any agent_* tool) to collect what the child needs.'
+        : ''
     }
 
     /**
@@ -814,14 +899,29 @@ return {
         console.log('agent-mesh: parking', entry.kind, entry.toolName, 'from', child.childId, 'as', requestId,
           '— waiting for', child.parentId)
         entry.requestId = requestId
-        queueNotice(child, entry.kind === 'question'
-          ? noticeForQuestion(child, requestId, entry)
-          : noticeForApproval(child, requestId, entry), true)
+        announceParked(child, requestId, entry, 0)
         a2aOnParked(child, requestId, entry)
+        if (extension !== undefined && typeof extension.onParked === 'function') extension.onParked(child, requestId, entry)
         if (request.signal !== undefined) {
           try { request.signal.addEventListener('abort', () => entry.settle('cancelled'), { once: true }) } catch (error) { /* older signal */ }
         }
       })
+    }
+
+    /**
+     * Tell the parent about a parked request. A Claude child's approval can reach
+     * us before its transcript shows the call, and an approval with no arguments
+     * is one nobody can judge, so give the log a moment to catch up.
+     */
+    function announceParked(child, requestId, entry, tries) {
+      if (!pending.has(requestId)) return
+      const waitingForCall = entry.kind !== 'question' && entry.callId !== undefined
+        && callArguments(child.childId, entry.callId) === undefined
+      if (waitingForCall && tries < 6) {
+        armTimeout(() => announceParked(child, requestId, entry, tries + 1), 250)
+        return
+      }
+      queueNotice(child, noticeForPending(child, requestId, entry), true)
     }
 
     function installApprovalBridge() {
@@ -829,6 +929,8 @@ return {
         const session = request.agent === undefined ? undefined : request.agent.session
         const childId = session === undefined ? '' : session.id
         const child = children.get(childId)
+        if (child !== undefined && extension !== undefined && typeof extension.allowsTool === 'function'
+          && extension.allowsTool(child, request.toolName)) return Promise.resolve('allowed-once')
         if (child === undefined || child.approvals === 'human') return next()
         if (child.approvals === 'allow') return Promise.resolve('allowed-once')
         if (child.approvals === 'deny') return Promise.resolve('rejected')
@@ -941,7 +1043,9 @@ return {
           id: q.id,
           header: q.header,
           question: q.question,
-          options: Array.isArray(q.options) ? q.options.map((o) => ({ label: o.label, description: o.description })) : [],
+          ...(q.detail === undefined ? {} : { detail: q.detail }),
+          ...(q.intent === undefined ? {} : { intent: { kind: q.intent.kind, approve: q.intent.approve } }),
+          options: Array.isArray(q.options) ? q.options.map((o) => ({ label: o.label, ...(o.description === undefined ? {} : { description: o.description }) })) : [],
           multiSelect: q.multiSelect === true,
         })),
         signal: request.signal,
@@ -1077,28 +1181,37 @@ return {
 
     function queueNotice(child, text, urgent) {
       if (child.notify === 'off') return
+      if (extension !== undefined && typeof extension.tagNotice === 'function') text = extension.tagNotice(child, text)
       const parentId = child.parentId
       if (parentId.length === 0 || parentId === child.childId) return
+      noticeTo(parentId, text, urgent, child)
+    }
+
+    /** Tell a conversation something, by the same route as a child's notice. `child` is who it is about, if one. */
+    function noticeTo(parentId, text, urgent, child) {
       const hook = wireHooks.get(parentId)
       if (hook !== undefined) {
         // A remote driver: there is no local dsh session to wake (the parent id
         // is an external handle), so push the notice to the driver's webhook.
         webhookPost(hook.url, hook.token, {
-          kind: 'notice', childId: child.childId, parentId: parentId,
+          kind: 'notice', ...(child === undefined ? {} : { childId: child.childId }), parentId: parentId,
           text: text, at: nowMs(),
         })
         return
       }
       const queued = notices.get(parentId) || []
       queued.push(text)
-      while (queued.length > 8) queued.shift()
+      // Bounded, but not tightly: dropping a notice about a parked child leaves
+      // that child blocked on a question its parent never saw.
+      while (queued.length > 32) queued.shift()
       notices.set(parentId, queued)
+      if (unreachableParents.has(parentId)) return
 
       const failed = (error) => console.error('agent-mesh: could not notify', parentId + ':', errorText(error))
       if (isRunning(parentId)) {
         // The parent is mid-turn. If it is blocked in a wait on this child, the
         // notice stays queued and the blocking op drains it into its own result.
-        if (child.blockingWait) return
+        if (child !== undefined && child.blockingWait) return
         const pendingTimer = deliveries.get(parentId)
         if (pendingTimer !== undefined) { deliveries.delete(parentId); pendingTimer() }
         deliverNotices(parentId).catch(failed)
@@ -1144,22 +1257,87 @@ return {
           mode: running ? 'steer' : 'queue',
           content: [{ type: 'text', text: queued.join('\n\n') }],
         })
+        unconfirmed.set(parentId, (unconfirmed.get(parentId) || []).concat(queued))
         console.log('agent-mesh: notified', parentId, 'about', queued.length, 'child event(s)', running ? '(steered)' : '(woke)')
       } catch (error) {
-        // Put it back rather than losing it — the parent may just be busy — and
-        // arm a retry, because nothing else will. Without one the notice sat in
-        // the queue until some LATER child event happened to push it out, which
-        // for a child blocked on a question is never.
+        // Put it back rather than losing it — the parent may just be busy.
         notices.set(parentId, (notices.get(parentId) || []).concat(queued))
-        if (!deliveries.has(parentId)) {
-          deliveries.set(parentId, armTimeout(() => {
-            deliveries.delete(parentId)
-            deliverNotices(parentId).catch((again) =>
-              console.error('agent-mesh: could not notify', parentId + ':', errorText(again)))
-          }, 3000))
+        // No such session, and none is coming: this parent is a handle. Its
+        // notices wait for its next agent_* call, which already drains them.
+        if (sessionOf(parentId) === undefined && /session\b.*\bnot found/i.test(errorText(error))) {
+          unreachableParents.add(parentId)
+          warnUnreachableParent(parentId)
+          return
         }
+        // Arm a retry, because nothing else will: the notice would otherwise sit
+        // until some LATER child event pushed it out, which for a child blocked
+        // on a question is never.
+        armNoticeRetry(parentId)
         throw error
       }
+    }
+
+    function armNoticeRetry(parentId) {
+      const failures = (deliveryFailures.get(parentId) || 0) + 1
+      deliveryFailures.set(parentId, failures)
+      if (deliveries.has(parentId)) return
+      deliveries.set(parentId, armTimeout(() => {
+        deliveries.delete(parentId)
+        deliverNotices(parentId).catch((again) =>
+          console.error('agent-mesh: could not notify', parentId + ':', errorText(again)))
+      }, Math.min(3000 * Math.pow(2, failures - 1), 60000)))
+    }
+
+    /**
+     * Why a turn that just ended failed, or undefined if it did not. The reason
+     * alone cannot say for a Claude child: claude-in-dsh takes over every turn
+     * by rejecting dsh's own step, so ALL of them end `blocked`, and a failure
+     * is only the notice it writes as the turn's last words.
+     */
+    function turnFailure(sessionId, reason) {
+      if (reason !== undefined && reason !== null && reason.kind === 'error') {
+        const failure = reason.error || {}
+        return String(failure.message || failure.code || 'unknown')
+      }
+      const logged = sessionEvents(sessionOf(sessionId))
+      for (let index = logged.length - 1; index >= 0; index -= 1) {
+        const event = logged[index]
+        if (event.type === 'turn/start') return undefined
+        if (event.type !== 'assistant/message') continue
+        const message = event.data.message || {}
+        const first = Array.isArray(message.content) && message.content[0] ? String(message.content[0].text || '') : ''
+        return message.source && message.source.model === 'cc-mode/notice' && first.indexOf(ENGINE_TURN_FAILED) === 0
+          ? first.slice(ENGINE_TURN_FAILED.length)
+          : undefined
+      }
+      return undefined
+    }
+
+    /**
+     * The prompt API accepting a notice only says a turn was opened for it. That
+     * turn can still die before the model reads a word: the engine could not
+     * reach its machine, say. Nothing would ever say it again, so a parent turn
+     * failing takes what it was carrying back into the queue. A notice that did
+     * get read just arrives twice, which costs far less than one that never did.
+     *
+     * Bounded, because a failure that is not going away must not spin. What is
+     * left stays queued and goes out with the parent's next notice or tool call.
+     */
+    function settleNotices(parentId, reason) {
+      const carried = unconfirmed.get(parentId)
+      if (carried === undefined) return
+      unconfirmed.delete(parentId)
+      if (turnFailure(parentId, reason) === undefined) {
+        deliveryFailures.delete(parentId)
+        return
+      }
+      notices.set(parentId, carried.concat(notices.get(parentId) || []))
+      if ((deliveryFailures.get(parentId) || 0) >= MAX_NOTICE_RETRIES) {
+        console.error('agent-mesh: giving up retrying for now:', parentId, 'keeps failing the turns that carry its notices')
+        return
+      }
+      console.error('agent-mesh: a turn carrying notices for', parentId, 'failed; they go out again')
+      armNoticeRetry(parentId)
     }
 
     function tailOf(child) {
@@ -1184,9 +1362,30 @@ return {
         + '\n用 agent_read 读全文（childId: ' + child.childId + '），或 agent_send 继续跟它说。'
     }
 
+    /** Who is asking, in words a parent juggling several children can place. */
+    function childLabel(child) {
+      const session = sessionOf(child.childId)
+      const title = session === undefined ? '' : titleOf(sessionEvents(session))
+      const where = child.remote !== undefined ? child.remote + ':' + (child.remoteCwd || '?') : child.cwd
+      return child.childId + (title ? ' 「' + title + '」' : '') + (where ? ' [' + where + ']' : '')
+    }
+
+    /** The arguments of the exact call being decided: what an approval is really about. */
+    function callArguments(childId, callId) {
+      if (callId === undefined) return undefined
+      const events = sessionEvents(sessionOf(childId))
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index]
+        if (event.type === 'tool/call' && event.data && event.data.callId === callId) return event.data.arguments
+      }
+      return undefined
+    }
+
     function noticeForApproval(child, requestId, entry) {
-      return '[子对话通知] ' + child.childId + ' 卡在一个权限请求上等你回答：'
+      const args = callArguments(child.childId, entry.callId)
+      return '[子对话通知] ' + childLabel(child) + ' 卡在一个权限请求上等你回答：'
         + requestId + ' · ' + entry.toolName + (entry.reason ? ' — ' + entry.reason : '')
+        + (args === undefined ? '' : '\n调用参数：' + truncate(typeof args === 'string' ? args : JSON.stringify(args), 1500))
         + '\n在你回答之前它一直阻塞着。用 agent_approve requestId=' + requestId + ' decision=allow|deny。'
     }
 
@@ -1194,14 +1393,35 @@ return {
       const qs = Array.isArray(entry.questions) ? entry.questions : []
       const lines = qs.map((q) => {
         const opts = Array.isArray(q.options) && q.options.length > 0
-          ? '\n   选项：' + q.options.map((o) => o.label).join(' / ')
+          ? '\n   选项' + (q.multiSelect === true ? '（可多选）' : '') + '：'
+            + q.options.map((o) => o.label + (o.description ? '（' + o.description + '）' : '')).join(' / ')
           : ''
-        return '· [' + q.id + '] ' + q.question + opts
+        const plan = q.intent && q.intent.kind === 'plan-review'
+          ? '\n   这是计划审核：选「' + q.intent.approve + '」表示批准，其它选项表示不批准。'
+          : ''
+        return '· [' + q.id + '] ' + (q.header ? q.header + '：' : '') + q.question
+          + (q.detail ? '\n   详情：' + truncate(q.detail, 4000) : '') + opts + plan
       })
-      return '[子对话通知] ' + child.childId + ' 在向你提问，等你回答（' + requestId + '）：\n'
+      return '[子对话通知] ' + childLabel(child) + ' 在向你提问，等你回答（' + requestId + '）：\n'
         + lines.join('\n')
-        + '\n用 agent_answer requestId=' + requestId + ' answers=[{id, selected:[标签], custom?}] 回答，'
-        + '或 agent_approve requestId=' + requestId + ' decision=deny 表示不回答让它自己继续。'
+        + '\n用 agent_answer requestId=' + requestId + ' answers=[{id, selected:[标签], custom?}] 回答；'
+        + '也可以直接 agent_send 一段文字，它会被当作这个提问的回答。拿不准就先问你自己的用户，再把答案传回来。'
+        + '要它不等答案自己继续：agent_approve requestId=' + requestId + ' decision=deny。'
+    }
+
+    function noticeForPending(child, requestId, entry) {
+      return entry.kind === 'question'
+        ? noticeForQuestion(child, requestId, entry)
+        : noticeForApproval(child, requestId, entry)
+    }
+
+    /** Full text of everything a child is parked on, for replies a parent reads instead of a notice. */
+    function pendingLines(child) {
+      const lines = []
+      for (const [id, entry] of pending) {
+        if (entry.childId === child.childId) lines.push(noticeForPending(child, id, entry))
+      }
+      return lines
     }
 
     /**
@@ -1229,9 +1449,7 @@ return {
         entry.reminded = true
         console.log('agent-mesh: reminding', parentId, 'about', entry.kind, 'from', entry.childId,
           '(' + requestId + ') — its turn ended without answering')
-        queueNotice(child, entry.kind === 'question'
-          ? noticeForQuestion(child, requestId, entry)
-          : noticeForApproval(child, requestId, entry), true)
+        queueNotice(child, noticeForPending(child, requestId, entry), true)
       }
     }
 
@@ -1241,11 +1459,14 @@ return {
         // This session may be a PARENT rather than a child: a turn ending with
         // one of its children still parked is the signal that a mid-turn notice
         // never landed.
+        const reason = event.data === undefined ? undefined : event.data.reason
+        settleNotices(session.id, reason)
         remindParent(session.id)
         const child = children.get(session.id)
         if (child === undefined) return
-        const reason = event.data === undefined ? undefined : event.data.reason
         a2aOnTurnEnd(child, reason)
+        // The extension can take over telling the parent, when "finished a turn" would be false.
+        if (extension !== undefined && typeof extension.onTurnEnd === 'function' && extension.onTurnEnd(child, reason) === 'handled') return
         if (reason !== undefined && reason.kind === 'aborted') return
         // A parent blocked in a wait on this child is told by that op's result;
         // do not also spend a second turn telling it the same turn ended.
@@ -1409,7 +1630,7 @@ return {
               status: status,
               report: 'Opened ' + child.engine + ' conversation ' + child.childId
                 + (child.cwd ? ' in ' + child.cwd : '') + '. Approvals go to: ' + child.approvals
-                + '. Send it something with agent_send.',
+                + '. Send it something with agent_send.' + externalNote(child),
             }
           }
           return send(child, args.prompt, 'auto', args.wait !== false, args.timeoutSeconds,
@@ -1467,7 +1688,45 @@ return {
             childId: child.childId,
             status: status,
             outcome: outcome,
-            report: report(headline(child, status, outcome), read.lines),
+            report: report(headline(child, status, outcome), read.lines.concat(pendingLines(child))),
+          }
+        },
+      },
+
+      {
+        name: 'agent_wait',
+        description: 'Block until one of your child conversations needs you or stops working, then return what it '
+          + 'said. A conversation inside dsh rarely needs this, because it is woken by itself. An external driver '
+          + '(a handle that is not a dsh session, such as a Claude Code outside dsh) has no other way to hear about '
+          + 'a blocked child, so end its long tasks with this.',
+        parameters: {
+          timeoutSeconds: { type: 'number', description: 'Give up after this long (default 300, at most 900).' },
+        },
+        async run(parentId, args) {
+          const seconds = typeof args.timeoutSeconds === 'number' && args.timeoutSeconds > 0 ? Math.min(args.timeoutSeconds, 900) : 300
+          const mine = Array.from(children.values()).filter((child) => child.parentId === parentId)
+          const parkedOn = () => mine.filter((child) => pendingLines(child).length > 0)
+          const working = mine.filter((child) => isRunning(child.childId))
+          const deadline = nowMs() + seconds * 1000
+          let outcome = 'timeout'
+          while (nowMs() < deadline) {
+            if ((notices.get(parentId) || []).length > 0 || parkedOn().length > 0) { outcome = 'news'; break }
+            if (working.length === 0 || working.some((child) => !isRunning(child.childId))) { outcome = working.length === 0 ? 'nothing-running' : 'news'; break }
+            await sleep(500)
+          }
+          // Say each parked request once, in its current words: a notice queued
+          // earlier for the same request is dropped, or the reply repeats it.
+          const lines = []
+          for (const child of mine) lines.push(...pendingLines(child))
+          const queued = notices.get(parentId) || []
+          const ids = lines.map((line) => (line.match(/req-\d+/) || [''])[0]).filter((id) => id.length > 0)
+          const rest = queued.filter((text) => !ids.some((id) => new RegExp(id + '(?!\\d)').test(text)))
+          if (rest.length > 0) notices.set(parentId, rest); else notices.delete(parentId)
+          const told = rest.join('\n')
+          return {
+            outcome: outcome,
+            report: report(outcome === 'timeout' ? 'Nothing new yet; your children are still working.'
+              : outcome === 'nothing-running' && lines.length === 0 && told.length === 0 ? 'None of your children is working.' : 'News from your children:', lines),
           }
         },
       },
@@ -1480,7 +1739,7 @@ return {
         parameters: {
           requestId: { type: 'string', required: true, description: 'The pending request id (from agent_read/agent_list).' },
           decision: { type: 'string', required: true, enum: ['allow', 'deny'], description: 'Allow this one call, or reject it.' },
-          reason: { type: 'string', description: 'Why — recorded in the log for the human reading later.' },
+          reason: { type: 'string', description: 'Why. When you deny, the child is told this, so it can adjust instead of retrying blindly.' },
         },
         run(parentId, args) {
           const entry = pending.get(String(args.requestId || ''))
@@ -1501,6 +1760,15 @@ return {
           }
           const outcome = args.decision === 'allow' ? 'allowed-once' : 'rejected'
           entry.settle(outcome)
+          // The engine only tells the child "the user denied this". Whoever
+          // refused had a reason, and without it the child guesses or retries.
+          if (outcome === 'rejected' && typeof args.reason === 'string' && args.reason.trim().length > 0) {
+            api('sessions', 'prompt', {
+              sessionId: entry.childId,
+              mode: 'steer',
+              content: [{ type: 'text', text: '[审批结果] 发起这个对话的一方拒绝了 ' + entry.toolName + '，不是用户本人。理由：' + args.reason.trim() }],
+            }).catch((error) => console.error('agent-mesh: could not pass the refusal on:', errorText(error)))
+          }
           console.log('agent-mesh: parent answered', args.requestId, '=', outcome,
             args.reason === undefined ? '' : '(' + args.reason + ')')
           return {
@@ -1524,6 +1792,7 @@ return {
             description: 'One entry per question: { id, selected: [labels], custom?: "free text" }.',
             items: {
               type: 'object',
+              additionalProperties: false,
               properties: {
                 id: { type: 'string' },
                 selected: { type: 'array', items: { type: 'string' } },
@@ -1679,7 +1948,31 @@ return {
       },
     ]
 
+    // The seam a bundle built on this core plugs into; absent in plain dsh-agent-mesh.
+    const extension = typeof meshExtension === 'function'
+      ? meshExtension({
+        ctx, subprocess, children, pending, runCapture, armTimeout, errorText, nowMs, randomToken, truncate, isLoopback,
+        api, sessionOf, sessionEvents, isRunning, statusOf, tailOf, childLabel, queueNotice, noticeTo, turnFailure, openChild, send, requireChild,
+        allowRemote: ALLOW_REMOTE, workspaceOf, runOp, neverAborted,
+      })
+      : undefined
+    if (extension !== undefined && Array.isArray(extension.ops)) OPS.push(...extension.ops)
+
     const opsByName = new Map(OPS.map((op) => [op.name, op]))
+
+    /**
+     * A call that guessed its parameter names must fail and say what they are.
+     * MCP clients do not all validate first: `String(undefined)` once went to a
+     * worker as the message "undefined".
+     */
+    function assertRequired(op, args) {
+      const parameters = op.parameters || {}
+      const missing = Object.keys(parameters).filter((key) => parameters[key].required === true && (args[key] === undefined || args[key] === null))
+      if (missing.length === 0) return
+      throw new Error('agent-mesh: ' + op.name + ' is missing ' + missing.join(', ')
+        + '. You passed: ' + (Object.keys(args).join(', ') || 'nothing')
+        + '. Its parameters: ' + Object.keys(parameters).map((key) => key + (parameters[key].required === true ? ' (required)' : '')).join(', ') + '.')
+    }
 
     async function runOp(name, parentId, args) {
       const op = opsByName.get(name)
@@ -1687,7 +1980,10 @@ return {
       if (typeof parentId !== 'string' || parentId.length === 0) {
         throw new Error('agent-mesh: ' + name + ' needs to know which conversation is asking')
       }
-      const value = await op.run(parentId, args === null || args === undefined ? {} : args)
+      const given = args === null || args === undefined ? {} : args
+      assertRequired(op, given)
+      if (extension !== undefined && typeof extension.guardOp === 'function') extension.guardOp(name, parentId, given)
+      const value = await op.run(parentId, given)
       const waiting = drainNotices(parentId)
       if (waiting.length === 0 || value === null || typeof value !== 'object') return value
       return {
@@ -1719,6 +2015,9 @@ return {
         bits.push(status.permissionPreset)
       }
       bits.push(status.running ? 'RUNNING' : 'idle')
+      if (status.claude !== undefined && status.claude.quotaWait) {
+        bits.push('waiting for the ' + status.claude.quotaWait.label + ' quota to reset at ' + status.claude.quotaWait.resetsAt + ', then it continues by itself')
+      }
       if (status.awaiting.length > 0) {
         bits.push('WAITING ON YOU: ' + status.awaiting
           .map((entry) => entry.requestId + ' (' + (entry.kind === 'question' ? 'question' : entry.toolName) + (entry.reason ? ' — ' + entry.reason : '') + ')')
@@ -1735,9 +2034,7 @@ return {
       }
       const agent = agentOf(child.childId)
       if (agent === undefined) return undefined
-      const signal = typeof AbortController === 'undefined'
-        ? { aborted: false, reason: undefined, addEventListener() {}, removeEventListener() {}, onabort: null, throwIfAborted() {} }
-        : new AbortController().signal
+      const signal = neverAborted()
       let execution
       try {
         execution = await commands.execute(agent, line, [], signal)
@@ -1760,10 +2057,50 @@ return {
       }
     }
 
-    async function send(child, text, mode, wait, timeoutSeconds, prefix) {
+    /**
+     * What images add to a prompt's content. dsh's prompt refuses images when the
+     * session's dsh model has no vision, a check that means nothing for a Claude
+     * conversation, so those go through the engine's own stash and ride the next
+     * message instead.
+     */
+    async function imageParts(child, images) {
+      if (!Array.isArray(images) || images.length === 0) return []
+      if (child.engine === 'claude') {
+        if (ccmode === undefined || typeof ccmode.stashImage !== 'function') {
+          throw new Error('agent-mesh: this claude-in-dsh cannot take images yet — update it')
+        }
+        for (const image of images) await ccmode.stashImage(child.childId, image.mediaType, image.data)
+        return []
+      }
+      return images.map((image) => ({ type: 'image', mediaType: image.mediaType, data: image.data, ...(image.name ? { name: image.name } : {}) }))
+    }
+
+    async function send(child, text, mode, wait, timeoutSeconds, prefix, images) {
       const before = sessionOf(child.childId)
-      const from = before === undefined ? -1 : lastSeqOf(before)
+      const latest = before === undefined ? -1 : lastSeqOf(before)
+      // Read on from wherever the parent stopped reading, never past it: what
+      // the child said between that read and this send (a round it opened on
+      // its own when a background task finished, say) would otherwise be
+      // skipped for good — the cursor used to jump straight to `latest`.
+      const from = typeof child.cursor === 'number' && child.cursor < latest ? child.cursor : latest
       touch(child)
+      // A child parked on a question is not reading its inbox: text sent to it
+      // would sit there unread and the child would stay blocked. A reply to a
+      // question in plain words is still a reply, so it answers the question.
+      const answered = text.charAt(0) === '/' ? undefined : answerParkedQuestion(child, text)
+      if (answered !== undefined) {
+        const note = 'Answered ' + answered + ' with your text. '
+        // The answer only carries words; the pictures follow it into the turn.
+        if (Array.isArray(images) && images.length > 0) {
+          const parts = await imageParts(child, images)
+          await api('sessions', 'prompt', { sessionId: child.childId, mode: 'steer', content: parts.concat([{ type: 'text', text: '（上面回答附带的图片）' }]) })
+        }
+        if (!wait) {
+          child.cursor = from
+          return { childId: child.childId, status: statusOf(child), report: prefix + note + headline(child, statusOf(child), 'read') }
+        }
+        return settledReply(child, from, timeoutSeconds, prefix + note)
+      }
       if (child.engine === 'dsh' && text.charAt(0) === '/') {
         const outcome = await runChildCommand(child, text)
         if (outcome !== undefined) {
@@ -1783,10 +2120,11 @@ return {
       // `auto` (default) cuts in: fold into the running turn, or start a new one
       // when the child is idle. Explicit steer/queue win over the default.
       const resolved = mode === 'steer' || mode === 'queue' ? mode : (isRunning(child.childId) ? 'steer' : 'queue')
-      const value = await api('sessions', 'prompt', {
+      const parts = await imageParts(child, images)
+      await api('sessions', 'prompt', {
         sessionId: child.childId,
         mode: resolved,
-        content: [{ type: 'text', text: text }],
+        content: parts.concat([{ type: 'text', text: text }]),
       })
       a2aOnSend(child, text)
       if (!wait) {
@@ -1795,9 +2133,15 @@ return {
           childId: child.childId,
           status: statusOf(child),
           report: prefix + 'Sent (' + resolved + '). ' + headline(child, statusOf(child), 'read')
-            + (child.notify === 'off' ? '' : ' — you will be told when it finishes.'),
+            + (child.notify === 'off' || child.parentExternal === true ? '' : ' — you will be told when it finishes.')
+            + externalNote(child),
         }
       }
+      return settledReply(child, from, timeoutSeconds, prefix)
+    }
+
+    /** Wait for a child to settle and report everything it produced since `from`. */
+    async function settledReply(child, from, timeoutSeconds, prefix) {
       const seconds = typeof timeoutSeconds === 'number' && timeoutSeconds > 0 ? Math.min(timeoutSeconds, 900) : 180
       const outcome = await settle(child, seconds * 1000)
       touch(child)
@@ -1811,6 +2155,22 @@ return {
         outcome: outcome,
         report: prefix + report(headline(child, status, outcome), read.lines),
       }
+    }
+
+    /** Settle the child's oldest parked question with free text; a label names its option. Returns its id. */
+    function answerParkedQuestion(child, text) {
+      for (const [requestId, entry] of pending) {
+        if (entry.childId !== child.childId || entry.kind !== 'question') continue
+        const trimmed = text.trim()
+        const answers = (entry.questions || []).map((q) => {
+          const option = (q.options || []).find((o) => o.label === trimmed)
+          return option === undefined ? { id: q.id, selected: [], custom: trimmed } : { id: q.id, selected: [option.label] }
+        })
+        entry.settle(entry.shapeAnswer({ answers: answers }))
+        console.log('agent-mesh: parent answered question', requestId, 'for', child.childId, 'by message')
+        return requestId
+      }
+      return undefined
     }
 
     // ---------- the control service claude-in-dsh reads ----------
@@ -2032,7 +2392,7 @@ return {
       if (method === 'tools/call') {
         const name = String(params.name || '')
         try {
-          const value = await runOp(name, parentId, params.arguments)
+          const value = await runOp(name, parentId, hopSafeArguments(name, parentId, params.arguments))
           respondJson(res, 200, {
             jsonrpc: '2.0', id: id,
             result: { content: [{ type: 'text', text: typeof value.report === 'string' ? value.report : JSON.stringify(value) }], isError: false },
@@ -2043,6 +2403,22 @@ return {
         return
       }
       rpcError(res, id, -32601, 'agent-mesh: unsupported MCP method "' + method + '"')
+    }
+
+    /**
+     * A Claude inside dsh calls through the engine's hop, which treats 25 seconds
+     * of silence as a dead dsh. Blocking longer turns every long wait into a
+     * "failure" the model then retries. It has no need to: dsh wakes it when a
+     * child has news. An external driver has no hop and no wake-up, so it keeps
+     * its long waits.
+     */
+    function hopSafeArguments(name, parentId, args) {
+      if (args === null || typeof args !== 'object' || sessionOf(parentId) === undefined) return args
+      const capped = (value, otherwise) => Math.min(typeof value === 'number' && value > 0 ? value : otherwise, HOP_SAFE_WAIT_SECONDS)
+      if (name === 'agent_send' || name === 'agent_open') return { ...args, timeoutSeconds: capped(args.timeoutSeconds, 180) }
+      if (name === 'agent_wait') return { ...args, timeoutSeconds: capped(args.timeoutSeconds, 300) }
+      if (name === 'agent_read' && typeof args.waitSeconds === 'number') return { ...args, waitSeconds: capped(args.waitSeconds, 0) }
+      return args
     }
 
     // ----- A2A server (the canonical Agent2Agent protocol) -------------------
@@ -2444,6 +2820,13 @@ return {
         armTimeout(activate, wait)
         return
       }
+      // dsh-agent-mesh and bundles built on this core expose the same tools and
+      // routes. Whichever mounted first owns them; a second copy stays out of it.
+      if (ctx.get('multiagentControl') !== undefined) {
+        console.error('agent-mesh: another plugin already provides multiagentControl — this copy is staying idle.'
+          + ' Compose only one of dsh-agent-mesh / dsh-superagent.')
+        return
+      }
       agents = ctx.get('agents')
       approval = ctx.get('approval')
       commands = ctx.get('commands')
@@ -2459,6 +2842,10 @@ return {
       disposers.push(watchChildren())
       disposers.push(publish())
       mountTransports()
+      if (extension !== undefined && typeof extension.activate === 'function') {
+        const stop = extension.activate(ctx.get('webServer'))
+        if (typeof stop === 'function') disposers.push(stop)
+      }
 
       registryReady = loadPersisted()
       registryReady

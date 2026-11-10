@@ -27,6 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/GeekRicardo/dsh-agent-mesh/main/ins
 | `agent_config` | 中途改子对话的模型/effort/权限档/审批去向 |
 | `agent_stop` | 打断当前轮（cancel）或彻底关掉并停止托管（close） |
 | `agent_list` | 列出你开的子对话及各自在等你的事项 |
+| `agent_wait` | 阻塞到子对话需要你或停下来（外部驱动方用，dsh 里的对话会被自动叫醒） |
 | `claude_usage` | 读本机 Claude 订阅用量各窗口（规划长任务用） |
 
 你不必坐着轮询：只要没传 `notify: "off"`，子对话**跑完一轮 / 卡在审批 / 要向你提问**时都会主动唤醒发起会话——哪怕发起会话此刻已经被 dsh 卸载（冷会话会被 resume 起来收这条消息）。
@@ -38,6 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/GeekRicardo/dsh-agent-mesh/main/ins
   - Claude 子对话：claude-in-dsh 把 CLI 的 `AskUserQuestion` / `ExitPlanMode` 交给本插件的 `answerQuestion`，路由回主对话的 `agent_answer`（答案按题面文本回给 CLI，和人在卡片里选的一模一样）。
   - dsh 子对话：本插件包装 `ctx.userQuestions` 的单槽 provider——`approvals=parent` 的托管子对话的提问（`ask_user_question` 与 `exit_plan_mode` 计划审核）会 park 给主对话，由 `agent_answer` 回答；其余会话照旧回人工卡片（teardown 时还原）。**
 - **发起方已停下**：通知是一条普通消息，投递到发起会话——正在跑就 `steer` 进当前轮，空闲/已卸载就 `queue` 一条新轮把它唤醒。
+- **用文字回提问**：子对话卡在提问时，`agent_send` 的文字会被当作回答；正好等于选项标签就算选中。审批不会被文字放行，只能 `agent_approve`。
+- **发起方不是 dsh 会话**（外部 MCP 客户端的固定 handle）：没有东西能叫醒它，通知攒到它下一次调用 `agent_*` 时带回；用 `agent_wait` 主动等，或开子对话时传 `notifyUrl`。
 
 ## 协议
 
